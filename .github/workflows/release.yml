@@ -74,7 +74,7 @@ jobs:
         run: npm ci
 
       - name: Build and release
-        uses: tauri-apps/tauri-action@v2
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Tauri updater 更新签名私钥（可选，在仓库 Secrets 中配置；
@@ -82,8 +82,7 @@ jobs:
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         with:
-          # 自动创建 GitHub Release 并上传全部构建产物
-          release: true
+          # 设置 tagName 后，tauri-action 自动创建 GitHub Release 并上传全部构建产物
           # __VERSION__ 自动替换为 tauri.conf.json 中的版本号
           tagName: v__VERSION__
           releaseName: 'TDengine Viewer v__VERSION__'
