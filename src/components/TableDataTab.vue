@@ -10,7 +10,7 @@ import {
 } from "naive-ui";
 import { describeTable, executeBatch } from "@/api";
 import { quoteIdent } from "@/utils/sql";
-import type { QueryResult } from "@/types";
+import type { FilterCond, QueryResult } from "@/types";
 import type { WorkspaceTab } from "@/stores/workspace";
 import ResultGrid from "@/components/ResultGrid.vue";
 import { IconRefresh } from "@/components/icons";
@@ -26,12 +26,15 @@ const result = ref<QueryResult | null>(null);
 const loading = ref(false);
 const sortField = ref<string | null>(null);
 const sortOrder = ref<"ascend" | "descend" | false>(false);
+// 各列筛选条件：field -> FilterCond | null
+const filters = ref<Record<string, FilterCond | null>>({});
 
 const full = () =>
   `${quoteIdent(props.tab.db!)}.${quoteIdent(props.tab.table!)}`;
 
-// 列名 -> SELECT 表达式。DECIMAL 列驱动暂不支持，CAST 成 VARCHAR 显示
-const colExpr = ref<Map<string, string>>(new Map());
+// 列名 -> SQL 表达式。DECIMAL 列驱动暂不支持，CAST 成 VARCHAR 显示。
+// select 用于 SELECT 列表（带 AS 别名）；plain 用于 ORDER BY / WHERE（不能带别名）
+const colExpr = ref<Map<string, { select: string; plain: string }>>(new Map());
 
 async function loadColumns() {
   try {
@@ -40,14 +43,17 @@ async function loadColumns() {
       props.tab.db!,
       props.tab.table!
     );
-    const m = new Map<string, string>();
+    const m = new Map<string, { select: string; plain: string }>();
     for (const c of cols) {
-      m.set(
-        c.name,
-        c.ty.toUpperCase().startsWith("DECIMAL")
-          ? `CAST(${quoteIdent(c.name)} AS VARCHAR) AS ${quoteIdent(c.name)}`
-          : quoteIdent(c.name)
-      );
+      const q = quoteIdent(c.name);
+      if (c.ty.toUpperCase().startsWith("DECIMAL")) {
+        m.set(c.name, {
+          select: `CAST(${q} AS VARCHAR) AS ${q}`,
+          plain: `CAST(${q} AS VARCHAR)`,
+        });
+      } else {
+        m.set(c.name, { select: q, plain: q });
+      }
     }
     colExpr.value = m;
   } catch {
@@ -57,55 +63,82 @@ async function loadColumns() {
 
 function selectList(): string {
   if (colExpr.value.size === 0) return "*";
-  return [...colExpr.value.values()].join(", ");
+  return [...colExpr.value.values()].map((e) => e.select).join(", ");
 }
 
-function orderExpr(name: string): string {
-  return colExpr.value.get(name) ?? quoteIdent(name);
+function plainExpr(name: string): string {
+  return colExpr.value.get(name)?.plain ?? quoteIdent(name);
 }
 
-async function loadData() {
-  loading.value = true;
-  try {
-    let sql = `SELECT ${selectList()} FROM ${full()}`;
-    if (sortField.value && sortOrder.value) {
-      sql += ` ORDER BY ${orderExpr(sortField.value)} ${
-        sortOrder.value === "ascend" ? "ASC" : "DESC"
-      }`;
+// 转义字符串值中的单引号，避免拼接 SQL 语法错误
+function escapeSqlValue(v: string): string {
+  return v.replace(/'/g, "''");
+}
+
+function buildWhere(): string {
+  const conds: string[] = [];
+  for (const [name, f] of Object.entries(filters.value)) {
+    if (!f || !f.value) continue;
+    const col = plainExpr(name);
+    const v = escapeSqlValue(f.value);
+    switch (f.op) {
+      case "contains":
+        conds.push(`${col} LIKE '%${v}%'`);
+        break;
+      case "notcontains":
+        conds.push(`${col} NOT LIKE '%${v}%'`);
+        break;
+      case "eq":
+        conds.push(`${col} = '${v}'`);
+        break;
+      case "neq":
+        conds.push(`${col} != '${v}'`);
+        break;
+      case "gt":
+        conds.push(`${col} > '${v}'`);
+        break;
+      case "ge":
+        conds.push(`${col} >= '${v}'`);
+        break;
+      case "lt":
+        conds.push(`${col} < '${v}'`);
+        break;
+      case "le":
+        conds.push(`${col} <= '${v}'`);
+        break;
     }
-    sql += ` LIMIT ${pageSize.value} OFFSET ${(page.value - 1) * pageSize.value}`;
-    const res = await executeBatch({
-      connId: props.tab.connId,
-      sqls: [sql],
-      maxRows: pageSize.value,
-    });
-    result.value = res[0];
-  } finally {
-    loading.value = false;
   }
+  return conds.length ? ` WHERE ${conds.join(" AND ")}` : "";
 }
 
-async function refresh() {
-  // COUNT 与 SELECT 合并为一次调用：后端按连接串行执行，
-  // 避免同一 WS 连接上的并发查询（旧版 taosAdapter 不支持）
+// 统一数据加载：withCount 时同时执行 COUNT（筛选/刷新后行数会变）
+async function loadPage(withCount: boolean) {
   loading.value = true;
   try {
-    await loadColumns();
-    let sql = `SELECT ${selectList()} FROM ${full()}`;
+    let sql = `SELECT ${selectList()} FROM ${full()}${buildWhere()}`;
     if (sortField.value && sortOrder.value) {
-      sql += ` ORDER BY ${orderExpr(sortField.value)} ${
+      sql += ` ORDER BY ${plainExpr(sortField.value)} ${
         sortOrder.value === "ascend" ? "ASC" : "DESC"
       }`;
     }
     sql += ` LIMIT ${pageSize.value} OFFSET ${(page.value - 1) * pageSize.value}`;
+    // COUNT 与 SELECT 合并为一次调用：后端按连接串行执行，
+    // 避免同一 WS 连接上的并发查询（旧版 taosAdapter 不支持）
+    const sqls = withCount
+      ? [`SELECT COUNT(*) FROM ${full()}${buildWhere()}`, sql]
+      : [sql];
     const res = await executeBatch({
       connId: props.tab.connId,
-      sqls: [`SELECT COUNT(*) FROM ${full()}`, sql],
+      sqls,
       maxRows: pageSize.value,
     });
-    const v = res[0].rows[0]?.[0];
-    total.value = typeof v === "number" ? v : Number(v ?? 0);
-    result.value = res[1];
+    if (withCount) {
+      const v = res[0].rows[0]?.[0];
+      total.value = typeof v === "number" ? v : Number(v ?? 0);
+      result.value = res[1];
+    } else {
+      result.value = res[0];
+    }
   } catch (e) {
     message.error(String(e));
   } finally {
@@ -113,23 +146,51 @@ async function refresh() {
   }
 }
 
+async function refresh() {
+  await loadColumns();
+  await loadPage(true);
+}
+
 function onSort(payload: { field: string; order: "ascend" | "descend" | false }) {
   sortField.value = payload.order ? payload.field : null;
   sortOrder.value = payload.order;
   page.value = 1;
-  loadData().catch((e) => message.error(String(e)));
+  // 排序不改变行数，无需重新 COUNT
+  loadPage(false);
+}
+
+function onFilter(payload: { field: string; cond: FilterCond | null }) {
+  if (payload.cond) {
+    filters.value = { ...filters.value, [payload.field]: payload.cond };
+  } else {
+    const next = { ...filters.value };
+    delete next[payload.field];
+    filters.value = next;
+  }
+  page.value = 1;
+  // 筛选改变行数，需要重新 COUNT
+  loadPage(true);
+}
+
+function clearFilters() {
+  filters.value = {};
+  page.value = 1;
+  loadPage(true);
 }
 
 function onPageChange(p: number) {
   page.value = p;
-  loadData().catch((e) => message.error(String(e)));
+  loadPage(false);
 }
 
 function onPageSizeChange(size: number) {
   pageSize.value = size;
   page.value = 1;
-  loadData().catch((e) => message.error(String(e)));
+  loadPage(true);
 }
+
+const activeFilterCount = () =>
+  Object.values(filters.value).filter(Boolean).length;
 
 onMounted(refresh);
 </script>
@@ -148,6 +209,16 @@ onMounted(refresh);
       </n-tag>
       <span class="d-meta mono">{{ tab.db }}.{{ tab.table }}</span>
       <span class="d-total">共 {{ total.toLocaleString() }} 行</span>
+      <n-tag
+        v-if="activeFilterCount() > 0"
+        size="small"
+        :bordered="false"
+        type="success"
+        closable
+        @close="clearFilters"
+      >
+        筛选中 × {{ activeFilterCount() }}
+      </n-tag>
       <div class="d-right">
         <span class="d-pagesize-label">每页</span>
         <n-select
@@ -166,7 +237,10 @@ onMounted(refresh);
         v-else-if="result"
         :result="result"
         remote-sort
+        :current-sort="{ field: sortField ?? '', order: sortOrder }"
+        :filters="filters"
         @sort="onSort"
+        @filter="onFilter"
       />
     </div>
 

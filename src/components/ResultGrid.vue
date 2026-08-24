@@ -1,12 +1,16 @@
 <script setup lang="ts">
-import { computed, h, type VNodeChild } from "vue";
+import { computed, defineComponent, h, ref, type PropType, type VNodeChild } from "vue";
 import {
+  NButton,
   NDataTable,
   NEllipsis,
+  NInput,
+  NSelect,
   NTag,
   type DataTableColumns,
 } from "naive-ui";
-import type { QueryResult } from "@/types";
+import type { FilterCond, QueryResult } from "@/types";
+import { IconFilter } from "@/components/icons";
 
 interface RowObj {
   __i: number;
@@ -15,8 +19,12 @@ interface RowObj {
 
 const props = defineProps<{
   result: QueryResult;
-  /** when true, sorting is delegated to the parent via the sort event */
+  /** true 时排序/筛选交给父组件处理（远程模式，表格不本地处理数据） */
   remoteSort?: boolean;
+  /** 受控排序状态（remoteSort 时生效） */
+  currentSort?: { field: string; order: "ascend" | "descend" | false } | null;
+  /** 各列的筛选条件（field -> FilterCond | null） */
+  filters?: Record<string, FilterCond | null> | null;
 }>();
 
 const emit = defineEmits<{
@@ -24,17 +32,52 @@ const emit = defineEmits<{
     e: "sort",
     payload: { field: string; order: "ascend" | "descend" | false }
   ): void;
+  (
+    e: "filter",
+    payload: { field: string; cond: FilterCond | null }
+  ): void;
 }>();
 
-const data = computed<RowObj[]>(() =>
-  props.result.rows.map((row, i) => {
+// ---------- 排序状态 ----------
+// 远程模式由父组件受控传入；本地模式（查询结果）内部维护
+const localSort = ref<{ field: string; order: "ascend" | "descend" } | null>(null);
+
+const activeSort = computed(() =>
+  props.remoteSort ? props.currentSort ?? null : localSort.value
+);
+
+function toggleSort(field: string) {
+  const cur = activeSort.value?.field === field ? activeSort.value.order : false;
+  // 点击循环：无 → 降序 → 升序 → 无
+  const next = !cur ? "descend" : cur === "descend" ? "ascend" : false;
+  if (props.remoteSort) {
+    emit("sort", { field: next ? field : "", order: next });
+  } else {
+    localSort.value = next ? { field, order: next } : null;
+  }
+}
+
+const data = computed<RowObj[]>(() => {
+  let rows = props.result.rows.map((row, i) => {
     const obj: RowObj = { __i: i };
     row.forEach((v, j) => {
       obj[`c${j}`] = v;
     });
     return obj;
-  })
-);
+  });
+  // 本地模式：在客户端排序（查询结果已全量取回）
+  if (!props.remoteSort && localSort.value) {
+    const idx = props.result.fields.findIndex(
+      (f) => f.name === localSort.value!.field
+    );
+    if (idx >= 0) {
+      const cmp = makeLocalSorter(idx);
+      const dir = localSort.value.order === "ascend" ? 1 : -1;
+      rows = rows.slice().sort((a, b) => cmp(a, b) * dir);
+    }
+  }
+  return rows;
+});
 
 function formatNumber(v: number): string {
   if (Number.isInteger(v)) return String(v);
@@ -85,6 +128,84 @@ function estimateWidth(idx: number): number {
   return Math.min(400, Math.max(96, maxLen * 8 + 42));
 }
 
+// ---------- 列筛选菜单（Navicat 风格：操作符 + 值） ----------
+
+const FILTER_OPS = [
+  { label: "包含", value: "contains" },
+  { label: "不包含", value: "notcontains" },
+  { label: "等于", value: "eq" },
+  { label: "不等于", value: "neq" },
+  { label: "大于", value: "gt" },
+  { label: "大于等于", value: "ge" },
+  { label: "小于", value: "lt" },
+  { label: "小于等于", value: "le" },
+];
+
+const FilterMenu = defineComponent({
+  name: "FilterMenu",
+  props: {
+    cond: { type: Object as PropType<FilterCond | null>, default: null },
+  },
+  emits: ["apply", "cancel"],
+  setup(props, { emit }) {
+    const op = ref<FilterCond["op"]>(props.cond?.op ?? "contains");
+    const value = ref(props.cond?.value ?? "");
+
+    function apply() {
+      const v = value.value.trim();
+      if (!v) {
+        emit("cancel");
+        return;
+      }
+      emit("apply", { op: op.value, value: v } satisfies FilterCond);
+    }
+
+    return () =>
+      h(
+        "div",
+        {
+          class: "col-filter-menu",
+          // 防止点击菜单内部时 Naive UI 弹层关闭
+          onMousedown: (e: MouseEvent) => e.stopPropagation(),
+          onClick: (e: MouseEvent) => e.stopPropagation(),
+        },
+        [
+          h(NSelect, {
+            value: op.value,
+            "onUpdate:value": (v: FilterCond["op"]) => (op.value = v),
+            options: FILTER_OPS,
+            size: "small",
+          }),
+          h(NInput, {
+            value: value.value,
+            "onUpdate:value": (v: string) => (value.value = v),
+            size: "small",
+            placeholder: "输入筛选值",
+            style: "margin-top: 8px",
+            autofocus: true,
+            onKeydown: (e: KeyboardEvent) => {
+              if (e.key === "Enter") apply();
+            },
+          }),
+          h("div", { class: "col-filter-actions" }, [
+            h(
+              NButton,
+              { size: "tiny", quaternary: true, onClick: () => emit("cancel") },
+              { default: () => "清除" }
+            ),
+            h(
+              NButton,
+              { size: "tiny", type: "primary", onClick: apply },
+              { default: () => "应用" }
+            ),
+          ]),
+        ]
+      );
+  },
+});
+
+// ---------- 列定义 ----------
+
 const columns = computed<DataTableColumns<RowObj>>(() => {
   const cols: DataTableColumns<RowObj> = [
     {
@@ -98,37 +219,61 @@ const columns = computed<DataTableColumns<RowObj>>(() => {
     },
   ];
   props.result.fields.forEach((f, idx) => {
+    const cond = props.filters?.[f.name] ?? null;
+    const isSorted = activeSort.value?.field === f.name;
     cols.push({
+      // 点击列名触发排序（Naive UI 虚拟滚动表头的内置排序点击在
+      // 2.40.1 中存在 column.sorter 丢失问题，这里自行绑定）
       title: () =>
-        h("span", { class: "col-title" }, [
-          f.name,
-          h("span", { class: "col-type" }, f.ty),
-        ]),
+        h(
+          "span",
+          {
+            class: "col-title col-title--sortable",
+            onClick: (e: MouseEvent) => {
+              e.stopPropagation();
+              toggleSort(f.name);
+            },
+          },
+          [
+            f.name,
+            h("span", { class: "col-type" }, f.ty),
+          ]
+        ),
       key: `c${idx}`,
       width: estimateWidth(idx),
       render: (row) => renderCell(row[`c${idx}`]),
-      sorter: props.remoteSort ? true : makeLocalSorter(idx),
+      sorter: true,
+      // 排序状态统一受控（远程来自父组件，本地来自 localSort），
+      // 由 title 的 click 处理排序切换，Naive UI 仅负责图标显示
+      sortOrder: isSorted ? activeSort.value?.order ?? false : false,
+      // 远程模式启用列筛选（Navicat 风格）
+      filter: props.remoteSort ? true : undefined,
+      filterOptionValue: cond ? cond.value : null,
+      renderFilterIcon: () =>
+        h(IconFilter, {
+          size: 12,
+          style: {
+            opacity: cond ? 1 : 0.4,
+            color: cond ? "#34d399" : undefined,
+          },
+        }),
+      renderFilterMenu: ({ hide }: { hide: () => void }) =>
+        h(FilterMenu, {
+          cond,
+          onApply: (c: FilterCond) => {
+            emit("filter", { field: f.name, cond: c });
+            hide();
+          },
+          onCancel: () => {
+            emit("filter", { field: f.name, cond: null });
+            hide();
+          },
+        }),
       ellipsis: { tooltip: false },
     });
   });
   return cols;
 });
-
-function onSorterChange(sorter: unknown) {
-  if (!props.remoteSort) return;
-  // naive sends a sorter object { column, order } or an array
-  const s = Array.isArray(sorter) ? sorter[0] : sorter;
-  if (s && typeof s === "object" && "order" in s && s.column) {
-    const key = String(s.column.key ?? "");
-    const idx = key.startsWith("c") ? Number(key.slice(1)) : NaN;
-    if (!Number.isNaN(idx)) {
-      emit("sort", {
-        field: props.result.fields[idx].name,
-        order: (s.order as "ascend" | "descend" | false) ?? false,
-      });
-    }
-  }
-}
 
 const totalRows = computed(() => props.result.rows.length);
 </script>
@@ -144,8 +289,8 @@ const totalRows = computed(() => props.result.rows.length);
       size="small"
       flex-height
       virtual-scroll
+      :remote="remoteSort"
       :single-line="false"
-      @update:sorter="onSorterChange"
     />
     <div class="grid-status">
       <span>{{ totalRows.toLocaleString() }} 行</span>
@@ -164,7 +309,7 @@ const totalRows = computed(() => props.result.rows.length);
       >
         结果已截断（达到行数上限）
       </n-tag>
-      <span class="grid-hint">点击列头排序</span>
+      <span class="grid-hint">点击列头排序<template v-if="remoteSort"> · 漏斗筛选</template></span>
     </div>
   </div>
 </template>
@@ -215,6 +360,15 @@ const totalRows = computed(() => props.result.rows.length);
   gap: 6px;
 }
 
+:deep(.col-title--sortable) {
+  cursor: pointer;
+  user-select: none;
+}
+
+:deep(.col-title--sortable:hover .col-type) {
+  opacity: 0.8;
+}
+
 :deep(.col-type) {
   font-size: 10px;
   opacity: 0.42;
@@ -257,5 +411,23 @@ const totalRows = computed(() => props.result.rows.length);
 
 :deep(td) {
   white-space: nowrap;
+}
+</style>
+
+<style>
+/* 列筛选菜单（renderFilterMenu 渲染在 body 弹层中，需全局样式） */
+.col-filter-menu {
+  width: 200px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.col-filter-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 10px;
 }
 </style>

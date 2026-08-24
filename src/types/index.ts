@@ -45,3 +45,9 @@ export interface ColumnMeta {
   length: number;
   note: string;
 }
+
+/** 数据表格列筛选条件（Navicat 风格） */
+export interface FilterCond {
+  op: "contains" | "notcontains" | "eq" | "neq" | "gt" | "ge" | "lt" | "le";
+  value: string;
+}

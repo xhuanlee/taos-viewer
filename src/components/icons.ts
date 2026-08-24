@@ -131,3 +131,7 @@ export const IconCopy = createIcon([
 
 export const IconChevronLeft = createIcon(["M15 6l-6 6 6 6"]);
 export const IconChevronRight = createIcon(["M9 6l6 6-6 6"]);
+
+export const IconFilter = createIcon([
+  "M22 3H2l8 9.46V19l4 2v-8.54L22 3z",
+]);

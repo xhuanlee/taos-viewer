@@ -26,7 +26,8 @@ export const useWorkspaceStore = defineStore("workspace", () => {
   function openQueryTab(connId: string, db?: string) {
     seq += 1;
     const id = `query-${Date.now()}-${seq}`;
-    const title = `查询 ${seq}`;
+    // 标题带上库名，标识查询窗口所属数据库
+    const title = db ? `查询 ${seq} @ ${db}` : `查询 ${seq}`;
     tabs.value.push({ id, type: "query", title, connId, db });
     activeId.value = id;
     return id;

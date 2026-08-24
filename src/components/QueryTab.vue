@@ -68,9 +68,11 @@ watch(db, () => {
 
 const schemaConfig = computed(() => {
   const tbs = connStore.tables[`${props.tab.connId}:${db.value ?? ""}`] ?? [];
-  const tables: Record<string, string[]> = {};
-  for (const tb of tbs) tables[tb.name] = [];
-  return { schema: { [db.value ?? "default"]: { tables } } };
+  // @codemirror/lang-sql 的 schema 格式：顶层 key 即表名（映射到列名数组），
+  // 输入部分表名（如 metr）时自动提示匹配的表（如 metric_history_data）
+  const schema: Record<string, string[]> = {};
+  for (const tb of tbs) schema[tb.name] = [];
+  return { schema };
 });
 
 const schemaComp = new Compartment();
