@@ -313,6 +313,129 @@ where
     }
 }
 
+/// 判断错误是否属于 taos-ws 驱动能力限制（可走 REST 兜底）
+fn is_driver_limitation(e: &Error) -> bool {
+    let s = e.to_string();
+    s.contains("暂不支持的数据类型") || s.contains("查询超时") || s.contains("查询任务异常终止")
+}
+
+/// 对单条 SQL 做 DECIMAL 自动 CAST 改写（用户无感知）。
+/// 仅处理"简单 SELECT"；复杂语句原样返回，由 REST 兜底。
+async fn auto_cast_decimals(taos: &Taos, db: Option<&str>, sql: &str) -> String {
+    let Some(parsed) = crate::decimal_compat::parse_simple_select(sql) else {
+        return sql.to_string();
+    };
+    // DESCRIBE 结果为 VARCHAR 字段，WS 通道安全
+    let table_db = parsed.table_db.as_deref().or(db);
+    let full = match table_db {
+        Some(d) => format!("{}.{}", quote_ident(d), quote_ident(&parsed.table)),
+        None => quote_ident(&parsed.table),
+    };
+    let desc = match query_to_result(taos, format!("DESCRIBE {}", full), 10_000).await {
+        Ok(r) => r,
+        Err(_) => return sql.to_string(),
+    };
+    let cols: Vec<crate::decimal_compat::ColumnType> = desc
+        .rows
+        .iter()
+        .map(|row| crate::decimal_compat::ColumnType {
+            name: json_to_string(row.first()),
+            ty: json_to_string(row.get(1)),
+        })
+        .collect();
+    crate::decimal_compat::rewrite(sql, &parsed, &cols, db).unwrap_or_else(|| sql.to_string())
+}
+
+/// REST 兜底：taos-ws 驱动无法处理 DECIMAL 等类型时，走 taosAdapter REST API。
+/// REST 返回 JSON 文本，天然支持所有类型。
+async fn rest_query_one(
+    config: &ConnectionConfig,
+    db: Option<&str>,
+    sql: &str,
+    max_rows: u64,
+) -> Result<QueryResult> {
+    let start = Instant::now();
+    let base = format!("http://{}:{}/rest/sql", config.host.trim(), config.port);
+    let url = match db {
+        Some(d) if !d.is_empty() => format!("{}/{}", base, urlencoding::encode(d)),
+        _ => base,
+    };
+    let client = reqwest::Client::builder()
+        .timeout(QUERY_TIMEOUT)
+        .build()
+        .map_err(|e| Error::Message(format!("REST 客户端创建失败：{e}")))?;
+    let resp = client
+        .post(&url)
+        .basic_auth(&config.user, Some(&config.password))
+        .header("Content-Type", "application/sql")
+        .body(sql.to_string())
+        .send()
+        .await
+        .map_err(|e| Error::Message(format!("REST 请求失败：{e}")))?;
+
+    let body: Json = resp
+        .json()
+        .await
+        .map_err(|e| Error::Message(format!("REST 响应解析失败：{e}")))?;
+
+    let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let desc = body
+            .get("desc")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
+        return Err(Error::Message(format!(
+            "SQL 执行失败（REST 兜底，code {code}）：{desc}\nSQL: {sql}"
+        )));
+    }
+
+    let mut fields: Vec<QueryField> = Vec::new();
+    if let Some(meta) = body.get("column_meta").and_then(|v| v.as_array()) {
+        for col in meta {
+            let arr = col.as_array();
+            if let Some(name) = arr.and_then(|a| a.first()).and_then(|v| v.as_str()) {
+                fields.push(QueryField {
+                    name: name.to_string(),
+                    ty: arr
+                        .and_then(|a| a.get(1))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("VARCHAR")
+                        .to_string(),
+                });
+            }
+        }
+    }
+
+    let mut rows: Vec<Vec<Json>> = Vec::new();
+    let mut truncated = false;
+    if let Some(data) = body.get("data").and_then(|v| v.as_array()) {
+        for row in data.iter().take(max_rows as usize + 1) {
+            if let Some(arr) = row.as_array() {
+                if rows.len() as u64 == max_rows {
+                    truncated = true;
+                    break;
+                }
+                rows.push(arr.clone());
+            }
+        }
+    }
+
+    let affected = body.get("affected_rows").and_then(|v| v.as_i64());
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    Ok(QueryResult {
+        sql: sql.to_string(),
+        fields,
+        rows,
+        elapsed_ms,
+        affected: if affected.unwrap_or(0) > 0 {
+            Some(affected.unwrap() as u64)
+        } else {
+            None
+        },
+        truncated,
+    })
+}
+
 #[tauri::command]
 pub async fn execute_batch(
     state: State<'_, AppState>,
@@ -322,7 +445,9 @@ pub async fn execute_batch(
     max_rows: Option<u64>,
 ) -> Result<Vec<QueryResult>> {
     let max_rows = max_rows.unwrap_or(10_000).clamp(1, 200_000);
-    run_guarded(&state, &conn_id, move |handle| async move {
+    let fallback_sqls = sqls.clone();
+    let fallback_db = db.clone();
+    match run_guarded(&state, &conn_id, move |handle| async move {
         let _guard = handle.lock.lock().await;
         let taos = &handle.taos;
 
@@ -332,12 +457,29 @@ pub async fn execute_batch(
 
         let mut results = Vec::with_capacity(sqls.len());
         for sql in sqls {
-            let result = query_to_result(taos, sql, max_rows).await?;
+            // 自动把简单 SELECT 中的 DECIMAL 列 CAST 成 VARCHAR（用户无感知）
+            let final_sql = auto_cast_decimals(taos, db.as_deref(), &sql).await;
+            let mut result = query_to_result(taos, final_sql, max_rows).await?;
+            // 展示给用户的仍是原始 SQL
+            result.sql = sql;
             results.push(result);
         }
         Ok(results)
     })
     .await
+    {
+        Ok(v) => Ok(v),
+        // 驱动不支持的结果类型（DECIMAL 等导致 panic/挂起）→ REST 兜底重试
+        Err(e) if is_driver_limitation(&e) => {
+            let handle = state.get_conn(&conn_id)?;
+            let mut results = Vec::with_capacity(fallback_sqls.len());
+            for sql in &fallback_sqls {
+                results.push(rest_query_one(&handle.config, fallback_db.as_deref(), sql, max_rows).await?);
+            }
+            Ok(results)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // ---------- metadata browsing ----------
@@ -878,13 +1020,12 @@ mod tests {
         run_read_suite(&local_config(), &db).await;
     }
 
-    /// 裸 SELECT DECIMAL 列可能使 taos-query panic 或挂起连接。
-    /// 验证：独立任务执行 + panic 捕获 + 连接重建后可继续查询
-    /// （run_guarded 的核心保护机制）。
+    /// 用户直接 `SELECT *` 含 DECIMAL 的表：auto_cast_decimals 应自动改写，
+    /// 无需手动 CAST，查询直接成功（WS 通道）。
     #[tokio::test]
-    async fn decimal_panic_recovery_local() {
+    async fn decimal_auto_cast_local() {
         let config = local_config();
-        let taos = Arc::new(connect_impl(&config).await.expect("连接失败"));
+        let taos = connect_impl(&config).await.expect("连接失败");
         let db = "taos_viewer_dectest";
         let _ = taos.exec(format!("DROP DATABASE IF EXISTS {}", quote_ident(db))).await;
         exec_batch_on(
@@ -892,60 +1033,102 @@ mod tests {
             None,
             &[
                 format!("CREATE DATABASE {}", quote_ident(db)),
-                "CREATE TABLE taos_viewer_dectest.d1 (ts TIMESTAMP, price DECIMAL(10,2))".to_string(),
-                "INSERT INTO taos_viewer_dectest.d1 VALUES (NOW, 12.34)".to_string(),
+                "CREATE TABLE taos_viewer_dectest.d1 (ts TIMESTAMP, price DECIMAL(10,2), memo VARCHAR(16))".to_string(),
+                "INSERT INTO taos_viewer_dectest.d1 VALUES (NOW, 12.34, 'a')".to_string(),
+                "INSERT INTO taos_viewer_dectest.d1 VALUES (NOW+1s, 56.78, 'b')".to_string(),
             ],
             100,
         )
         .await
         .expect("准备数据失败");
 
-        // 在独立任务中执行裸 DECIMAL 查询（模拟 run_guarded 的 spawn）。
-        // 已知驱动限制：taos-ws 后台读取任务在反序列化 DECIMAL 字段类型时会
-        // panic（"unknown data type"），此后查询永久挂起 —— run_guarded 通过
-        // 超时 + 自动重连兜底，表数据浏览则通过自动 CAST 规避此问题。
-        let t = taos.clone();
-        let join = tokio::task::spawn(async move {
-            query_to_result(&t, "SELECT price FROM taos_viewer_dectest.d1".to_string(), 100).await
-        });
-        let outcome = tokio::time::timeout(Duration::from_secs(5), join).await;
+        // 模拟 execute_batch 的路径：auto_cast_decimals → query_to_result
+        let raw = "select * from d1";
+        let rewritten = auto_cast_decimals(&taos, Some(db), raw).await;
+        assert!(
+            rewritten.to_uppercase().contains("CAST(`PRICE` AS VARCHAR)"),
+            "应包含自动 CAST：{rewritten}"
+        );
+        let res = query_to_result(&taos, rewritten, 100)
+            .await
+            .expect("自动 CAST 后查询应成功");
+        assert_eq!(res.rows.len(), 2, "应返回 2 行");
+        assert_eq!(res.fields.len(), 3);
+        let price_idx = res.fields.iter().position(|f| f.name.eq_ignore_ascii_case("price")).unwrap();
+        let prices: Vec<String> = res.rows.iter().map(|r| json_to_string(r.get(price_idx))).collect();
+        assert_eq!(prices, vec!["12.34", "56.78"]);
+        println!("auto-cast select * ok: prices = {prices:?}");
 
-        match outcome {
-            Ok(Ok(Ok(_))) => {
-                // 驱动已支持 DECIMAL：直接通过
-                println!("raw DECIMAL select ok (driver supports it)");
-            }
-            Ok(Ok(Err(e))) => {
-                // 返回错误：可接受的失败形态
-                println!("raw DECIMAL select error (acceptable): {e}");
-            }
-            Ok(Err(join_err)) => {
-                assert!(join_err.is_panic(), "应为 panic");
-                println!("raw DECIMAL select panicked (captured by task boundary)");
-            }
-            Err(_) => {
-                // 挂起直到超时：已知驱动限制，run_guarded 会超时重连
-                println!("raw DECIMAL select hung until timeout (known driver limitation)");
-            }
-        }
+        // 指定列 + WHERE + LIMIT 同样生效
+        let raw2 = "SELECT ts, price FROM d1 WHERE memo = 'a' LIMIT 1";
+        let rewritten2 = auto_cast_decimals(&taos, Some(db), raw2).await;
+        let res2 = query_to_result(&taos, rewritten2, 100)
+            .await
+            .expect("指定列自动 CAST 查询应成功");
+        assert_eq!(res2.rows.len(), 1);
+        assert_eq!(json_to_string(res2.rows[0].get(1)), "12.34");
 
-        // 无论哪种情况，重建连接后查询必须能继续工作
-        let fresh = Arc::new(connect_impl(&config).await.expect("重连失败"));
-        let res = query_to_result(
-            &fresh,
-            "SELECT CAST(price AS VARCHAR) AS price FROM taos_viewer_dectest.d1".to_string(),
+        taos.exec(format!("DROP DATABASE IF EXISTS {}", quote_ident(db)))
+            .await
+            .expect("清理失败");
+    }
+
+    /// REST 兜底通道：直接执行含 DECIMAL 的复杂查询（自动改写不覆盖的场景）
+    /// 与 INSERT 语句，验证 REST API 返回正确。
+    #[tokio::test]
+    async fn rest_fallback_local() {
+        let config = local_config();
+        let taos = connect_impl(&config).await.expect("连接失败");
+        let db = "taos_viewer_resttest";
+        let _ = taos.exec(format!("DROP DATABASE IF EXISTS {}", quote_ident(db))).await;
+        exec_batch_on(
+            &taos,
+            None,
+            &[
+                format!("CREATE DATABASE {}", quote_ident(db)),
+                "CREATE TABLE taos_viewer_resttest.d1 (ts TIMESTAMP, price DECIMAL(10,2))".to_string(),
+                "INSERT INTO taos_viewer_resttest.d1 VALUES (NOW, 12.34)".to_string(),
+                "INSERT INTO taos_viewer_resttest.d1 VALUES (NOW+1s, 56.78)".to_string(),
+            ],
             100,
         )
         .await
-        .expect("重连后 CAST 查询失败");
-        assert_eq!(res.rows.len(), 1);
-        let v = json_to_string(res.rows[0].first());
-        assert_eq!(v, "12.34");
-        println!("reconnect + CAST query ok: price = {v}");
+        .expect("准备数据失败");
 
-        let _ = fresh
-            .exec(format!("DROP DATABASE IF EXISTS {}", quote_ident(db)))
-            .await;
+        // 裸 DECIMAL 复杂查询（avg 结果也是 DECIMAL，WS 必挂）→ REST 应成功
+        let res = rest_query_one(&config, Some(db), "SELECT AVG(price) FROM d1", 100)
+            .await
+            .expect("REST 兜底查询失败");
+        assert_eq!(res.rows.len(), 1);
+        let avg = json_to_string(res.rows[0].first());
+        assert!(avg.starts_with("34.56"), "AVG 应为 34.56x，实际 {avg}");
+        println!("REST fallback avg(price) = {avg}");
+
+        // REST SELECT 全列
+        let res2 = rest_query_one(&config, Some(db), "SELECT * FROM d1", 100)
+            .await
+            .expect("REST 全列查询失败");
+        assert_eq!(res2.rows.len(), 2);
+        assert_eq!(res2.fields.len(), 2);
+
+        // REST INSERT（DDL/DML 走 REST 亦应正常）
+        let res3 = rest_query_one(&config, Some(db), "INSERT INTO d1 VALUES (NOW+2s, 99.99)", 100)
+            .await
+            .expect("REST INSERT 失败");
+        println!("REST insert affected = {:?}", res3.affected);
+        let cnt = rest_query_one(&config, Some(db), "SELECT COUNT(*) FROM d1", 10)
+            .await
+            .expect("REST COUNT 失败");
+        assert_eq!(json_to_string(cnt.rows[0].first()), "3");
+        println!("REST insert ok, count = 3");
+
+        // REST 语法错误应返回明确错误
+        let err = rest_query_one(&config, Some(db), "SELEC bad", 10).await;
+        assert!(err.is_err(), "语法错误应报错");
+
+        taos.exec(format!("DROP DATABASE IF EXISTS {}", quote_ident(db)))
+            .await
+            .expect("清理失败");
     }
 
     #[tokio::test]
@@ -956,6 +1139,20 @@ mod tests {
         };
         let db = env_or("TAOS_TEST_REMOTE_DB", "test");
         run_read_suite(&config, &db).await;
+
+        // 用户实际场景：裸 SELECT * 含 DECIMAL 的表（此前报"暂不支持的数据类型"）
+        let taos = connect_impl(&config).await.expect("连接失败");
+        let sql = "select * from metric_history_data limit 10";
+        let rewritten = auto_cast_decimals(&taos, Some(&db), sql).await;
+        assert_ne!(rewritten, sql, "含 DECIMAL 的表应被自动改写");
+        let res = query_to_result(&taos, rewritten, 100)
+            .await
+            .expect("裸 SELECT *（含 DECIMAL）应自动 CAST 后成功");
+        println!(
+            "remote raw select * ok: {} fields, {} rows",
+            res.fields.len(),
+            res.rows.len()
+        );
     }
 
     #[tokio::test]

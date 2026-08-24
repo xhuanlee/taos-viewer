@@ -1,4 +1,5 @@
 mod commands;
+mod decimal_compat;
 mod error;
 mod models;
 mod state;

@@ -184,19 +184,28 @@ async function runSql() {
 const dragging = ref(false);
 
 function onDragStart(e: MouseEvent) {
+  e.preventDefault();
+  // 注意：必须在 mousedown 时保存容器引用，
+  // mousemove 回调里访问 e.currentTarget 已失效（为 null）
+  const container = (e.currentTarget as HTMLElement)
+    .closest(".query-tab") as HTMLElement | null;
+  if (!container) return;
+  const rect = container.getBoundingClientRect();
+  const toolbarH = 40; // 工具栏高度，换算编辑区百分比时扣除
   dragging.value = true;
   const onMove = (ev: MouseEvent) => {
-    const host = e.currentTarget as HTMLElement;
-    const container = host.closest(".query-tab") as HTMLElement;
-    const rect = container.getBoundingClientRect();
-    const pct = ((ev.clientY - rect.top) / rect.height) * 100;
+    const usable = rect.height - toolbarH;
+    if (usable <= 0) return;
+    const pct = ((ev.clientY - rect.top - toolbarH) / usable) * 100;
     editorFlex.value = Math.min(85, Math.max(15, pct));
   };
   const onUp = () => {
     dragging.value = false;
     window.removeEventListener("mousemove", onMove);
     window.removeEventListener("mouseup", onUp);
+    document.body.classList.remove("resizing-rows");
   };
+  document.body.classList.add("resizing-rows");
   window.addEventListener("mousemove", onMove);
   window.addEventListener("mouseup", onUp);
 }
@@ -366,16 +375,35 @@ const resultTabs = computed(() =>
 }
 
 .q-splitter {
-  height: 5px;
+  height: 7px;
   flex-shrink: 0;
   cursor: row-resize;
   background: transparent;
   position: relative;
   z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-bottom: 1px solid var(--app-border);
 }
 
-.q-splitter:hover {
-  background: rgba(52, 211, 153, 0.25);
+.q-splitter::after {
+  content: "";
+  width: 36px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--app-border);
+  transition: background 0.15s;
+}
+
+.q-splitter:hover::after,
+.q-splitter:active::after {
+  background: #34d399;
+}
+
+:global(body.resizing-rows) {
+  cursor: row-resize;
+  user-select: none;
 }
 
 .q-drag-mask {
@@ -394,6 +422,7 @@ const resultTabs = computed(() =>
 
 .q-result-tabs {
   height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
 }
@@ -402,8 +431,16 @@ const resultTabs = computed(() =>
   font-size: 12px;
 }
 
+/* 此版本 Naive UI 无 pane-wrapper，n-tab-pane 是 .n-tabs 直接子元素 */
+.q-result-tabs:deep(.n-tabs > .n-tab-pane) {
+  flex: 1;
+  min-height: 0;
+  padding: 0;
+}
+
+/* 兼容带 pane-wrapper 的结构 */
 .q-result-tabs :deep(.n-tabs-pane-wrapper),
-.q-result-tabs :deep(.n-tab-pane) {
+.q-result-tabs :deep(.n-tabs-pane-wrapper .n-tab-pane) {
   height: 100%;
   padding: 0;
 }

@@ -130,6 +130,16 @@ function newQuery() {
   padding-top: 6px;
 }
 
+/* 此版本 Naive UI 无 pane-wrapper，n-tab-pane 是 .n-tabs 直接子元素 */
+.workspace :deep(.n-tabs > .n-tab-pane) {
+  flex: 1;
+  min-height: 0;
+  padding: 0;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+/* 兼容带 pane-wrapper 的结构 */
 .workspace :deep(.n-tabs .n-tabs-pane-wrapper) {
   flex: 1;
   min-height: 0;

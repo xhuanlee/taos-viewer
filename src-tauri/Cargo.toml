@@ -22,6 +22,8 @@ chrono = "0.4"
 urlencoding = "2"
 futures-util = { version = "0.3", default-features = false }
 taos = { version = "0.12", default-features = false, features = ["ws"] }
+# REST 兜底通道：taos-ws 驱动不支持 DECIMAL 结果类型时自动降级到 taosAdapter REST API
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 [profile.release]
 codegen-units = 1
