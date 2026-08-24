@@ -1,0 +1,23 @@
+# Node / 前端
+node_modules/
+dist/
+*.local
+
+# Rust / Tauri 构建产物
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# 开发调试脚本
+src-tauri/examples/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# 日志与环境变量
+*.log
+.env
+.env.*

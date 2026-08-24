@@ -1,0 +1,30 @@
+[package]
+name = "taos-viewer"
+version = "0.1.0"
+description = "A sleek and fast GUI client for TDengine"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "taos_viewer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+thiserror = "2"
+chrono = "0.4"
+urlencoding = "2"
+futures-util = { version = "0.3", default-features = false }
+taos = { version = "0.12", default-features = false, features = ["ws"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
