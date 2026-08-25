@@ -13,6 +13,24 @@
 - **表管理**：新建 / 删除 / 清空表
 - **界面**：暗色 / 亮色主题切换、侧边栏宽度可拖拽调整（自动记忆）、现代化简洁设计
 
+## 界面截图
+
+### 新建连接
+
+[![新建连接](screenshots/add_connect.png)](screenshots/add_connect.png)
+
+### 新建查询（表名智能提示）
+
+[![新建查询](screenshots/new_query.png)](screenshots/new_query.png)
+
+### 数据浏览（远程排序 + 列筛选）
+
+[![数据浏览](screenshots/table_data_view.png)](screenshots/table_data_view.png)
+
+### 列筛选
+
+[![列筛选](screenshots/col_filter.png)](screenshots/col_filter.png)
+
 ## 技术栈
 
 | 层 | 技术 |
